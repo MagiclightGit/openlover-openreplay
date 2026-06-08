@@ -76,6 +76,220 @@ OpenReplay can be deployed anywhere. Follow our step-by-step guides for deployin
 - [OVHcloud](https://docs.openreplay.com/deployment/deploy-ovhcloud)
 - [Kubernetes](https://docs.openreplay.com/deployment/deploy-kubernetes)
 
+## Single-Node Maintenance
+
+For this fork, a practical Ubuntu 24.04 single-node deploy and repair guide is available here:
+
+- [docs/openreplay-ubuntu-single-node-deploy.md](docs/openreplay-ubuntu-single-node-deploy.md)
+
+If you want the instance to run long-term on one machine, the most important maintenance task is preventing disk usage from growing forever.
+
+The script below is a complete single-node maintenance setup that:
+
+- Keeps OpenReplay data to 3 days where supported
+- Runs `openreplay -c 3 --force`
+- Cleans common MinIO buckets older than 3 days
+- Removes succeeded and failed Kubernetes pods
+- Vacuums systemd logs and apt cache
+- Checks ClickHouse TTL settings every day and writes alerts if they drift
+
+Create the maintenance script:
+
+```bash
+sudo tee /usr/local/bin/openreplay-maintenance-plus.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_FILE="/var/log/openreplay-maintenance.log"
+ALERT_FILE="/var/log/openreplay-clickhouse-ttl-alert.log"
+RETENTION_DAYS="3"
+OR_DIR="/var/lib/openreplay"
+YQ_BIN="/var/lib/openreplay/yq"
+
+CLICKHOUSE_TABLES=(
+  "experimental.sessions"
+  "experimental.ios_events"
+  "experimental.issues"
+  "experimental.user_viewed_sessions"
+  "experimental.user_viewed_errors"
+  "product_analytics.events"
+  "product_analytics.all_events"
+  "product_analytics.event_properties"
+  "product_analytics.all_properties"
+  "product_analytics.autocomplete_events_grouped"
+  "product_analytics.autocomplete_event_properties_grouped"
+  "product_analytics.autocomplete_simple"
+  "product_analytics.autocomplete_user_properties_grouped"
+)
+
+echo "==== $(date '+%F %T') maintenance start ====" >> "$LOG_FILE"
+
+openreplay -c "$RETENTION_DAYS" --force >> "$LOG_FILE" 2>&1 || true
+
+kubectl get pod -A --field-selector=status.phase=Succeeded -o name 2>/dev/null | xargs -r kubectl delete >> "$LOG_FILE" 2>&1 || true
+kubectl get pod -A --field-selector=status.phase=Failed -o name 2>/dev/null | xargs -r kubectl delete >> "$LOG_FILE" 2>&1 || true
+
+if [ -x "$YQ_BIN" ] && [ -f "$OR_DIR/vars.yaml" ]; then
+  MINIO_HOST=$("$YQ_BIN" 'explode(.) | .global.s3.endpoint' "$OR_DIR/vars.yaml" | tr -d '"')
+  MINIO_ACCESS_KEY=$("$YQ_BIN" 'explode(.) | .global.s3.accessKey' "$OR_DIR/vars.yaml" | tr -d '"')
+  MINIO_SECRET_KEY=$("$YQ_BIN" 'explode(.) | .global.s3.secretKey' "$OR_DIR/vars.yaml" | tr -d '"')
+
+  kubectl delete pod -n app minio-extra-cleanup --ignore-not-found=true >> "$LOG_FILE" 2>&1 || true
+
+  cat <<EOF2 | kubectl apply -f - >> "$LOG_FILE" 2>&1
+apiVersion: v1
+kind: Pod
+metadata:
+  name: minio-extra-cleanup
+  namespace: app
+spec:
+  restartPolicy: Never
+  containers:
+  - name: minio-extra-cleanup
+    image: ghcr.io/openreplay/minio
+    command: ["/bin/bash","-lc"]
+    args:
+      - |
+        set -e
+        mc alias set minio "$MINIO_HOST" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+        for bucket in mobs sessions-assets sourcemaps records spots; do
+          mc rm --recursive --dangerous --force --older-than ${RETENTION_DAYS}d "minio/\${bucket}" || true
+        done
+    env:
+    - name: MINIO_HOST
+      value: "$MINIO_HOST"
+    - name: MINIO_ACCESS_KEY
+      value: "$MINIO_ACCESS_KEY"
+    - name: MINIO_SECRET_KEY
+      value: "$MINIO_SECRET_KEY"
+EOF2
+
+  kubectl wait -n app --for=jsonpath='{.status.phase}'=Succeeded pod/minio-extra-cleanup --timeout=600s >> "$LOG_FILE" 2>&1 || true
+  kubectl logs -n app minio-extra-cleanup --tail=200 >> "$LOG_FILE" 2>&1 || true
+  kubectl delete pod -n app minio-extra-cleanup --ignore-not-found=true >> "$LOG_FILE" 2>&1 || true
+fi
+
+CH_POD=$(kubectl -n db get pod -l app.kubernetes.io/name=clickhouse -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+if [ -n "${CH_POD}" ]; then
+  echo "--- clickhouse ttl check ---" >> "$LOG_FILE"
+  for item in "${CLICKHOUSE_TABLES[@]}"; do
+    DB="${item%%.*}"
+    TB="${item##*.}"
+
+    QUERY_RESULT=$(kubectl exec -n db -c clickhouse "$CH_POD" -- clickhouse-client -q "
+      SELECT create_table_query
+      FROM system.tables
+      WHERE database = '${DB}' AND name = '${TB}'
+      FORMAT TSVRaw
+    " 2>/dev/null || true)
+
+    echo "[$(date '+%F %T')] ${item}" >> "$LOG_FILE"
+    echo "$QUERY_RESULT" >> "$LOG_FILE"
+    echo >> "$LOG_FILE"
+
+    if [ -z "$QUERY_RESULT" ]; then
+      echo "$(date '+%F %T') missing table definition: ${item}" >> "$ALERT_FILE"
+      continue
+    fi
+
+    if ! echo "$QUERY_RESULT" | grep -Eq "INTERVAL 3 DAY|toIntervalDay\\(3\\)"; then
+      echo "$(date '+%F %T') TTL mismatch for ${item}" >> "$ALERT_FILE"
+    fi
+  done
+else
+  echo "$(date '+%F %T') clickhouse pod not found" >> "$ALERT_FILE"
+fi
+
+journalctl --vacuum-time=3d >> "$LOG_FILE" 2>&1 || true
+apt-get clean >> "$LOG_FILE" 2>&1 || true
+
+echo "--- disk usage ---" >> "$LOG_FILE"
+df -h / /var/lib/rancher/k3s /openreplay/storage /var/log >> "$LOG_FILE" 2>&1 || true
+
+echo "--- top dirs ---" >> "$LOG_FILE"
+du -sh /openreplay/storage /var/lib/rancher/k3s /var/log 2>/dev/null >> "$LOG_FILE" || true
+
+echo "==== $(date '+%F %T') maintenance end ====" >> "$LOG_FILE"
+EOF
+```
+
+Make it executable:
+
+```bash
+sudo chmod +x /usr/local/bin/openreplay-maintenance-plus.sh
+```
+
+Run it every day at `03:30`:
+
+```bash
+sudo tee /etc/cron.d/openreplay-maintenance >/dev/null <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+30 3 * * * root /usr/local/bin/openreplay-maintenance-plus.sh
+EOF
+```
+
+```bash
+sudo chmod 644 /etc/cron.d/openreplay-maintenance
+sudo systemctl restart cron
+sudo systemctl status cron --no-pager
+```
+
+Rotate maintenance and pod logs:
+
+```bash
+sudo tee /etc/logrotate.d/openreplay-k3s >/dev/null <<'EOF'
+/var/log/pods/*/*/*.log /var/log/openreplay-maintenance.log {
+  daily
+  rotate 3
+  missingok
+  notifempty
+  compress
+  delaycompress
+  copytruncate
+  maxsize 200M
+}
+EOF
+```
+
+Test once manually:
+
+```bash
+sudo /usr/local/bin/openreplay-maintenance-plus.sh
+tail -100 /var/log/openreplay-maintenance.log
+tail -100 /var/log/openreplay-clickhouse-ttl-alert.log
+```
+
+If ClickHouse should also keep only 3 days for the main analytical tables, use:
+
+```bash
+CH_POD=$(kubectl -n db get pod -l app.kubernetes.io/name=clickhouse -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n db -c clickhouse "$CH_POD" -- clickhouse-client --multiquery <<'SQL'
+ALTER TABLE experimental.sessions MODIFY TTL datetime + toIntervalDay(3);
+ALTER TABLE experimental.ios_events MODIFY TTL datetime + toIntervalDay(3);
+ALTER TABLE experimental.issues MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE experimental.user_viewed_sessions MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE experimental.user_viewed_errors MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.all_events MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.event_properties MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.all_properties MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.autocomplete_events_grouped MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.autocomplete_event_properties_grouped MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.autocomplete_simple MODIFY TTL _timestamp + toIntervalDay(3);
+ALTER TABLE product_analytics.autocomplete_user_properties_grouped MODIFY TTL _timestamp + toIntervalDay(3);
+SQL
+```
+
+`product_analytics.events` may already show as:
+
+```sql
+TTL created_at + toIntervalDay(3)
+```
+
+which is already valid for the maintenance check above.
+
 ## OpenReplay Cloud
 
 For those who want to simply use OpenReplay as a service, [sign up](https://app.openreplay.com/signup) for a free account on our cloud offering.
